@@ -136,16 +136,28 @@ func (a *App) startup(ctx context.Context) {
 	cfg.Debug = false
 	cfg.DisableIPv6 = false
 	cfg.NoDHT = false
-	cfg.ListenPort = 42069
-	cfg.DefaultStorage = storage.NewFile(a.downloadDir)
 
-	// Create client
-	client, err := torrent.NewClient(cfg)
-	if err != nil {
-		log.Printf("Error creating torrent client: %v", err)
-		wailsruntime.LogError(ctx, fmt.Sprintf("Failed to create torrent client: %v", err))
+	// Try multiple ports if the default is in use
+	ports := []int{42069, 42070, 42071, 42072, 0} // 0 means random port
+	var client *torrent.Client
+	var lastErr error
+
+	for _, port := range ports {
+		cfg.ListenPort = port
+		client, lastErr = torrent.NewClient(cfg)
+		if lastErr == nil {
+			log.Printf("✓ Torrent client listening on port: %d", port)
+			break
+		}
+		log.Printf("⚠ Port %d unavailable: %v", port, lastErr)
+	}
+
+	if client == nil {
+		log.Printf("❌ Error creating torrent client after trying all ports: %v", lastErr)
+		wailsruntime.LogError(ctx, fmt.Sprintf("Failed to create torrent client: %v", lastErr))
 		return
 	}
+
 	a.client = client
 
 	// Load saved torrents
@@ -393,24 +405,23 @@ func (a *App) CreateTorrentFromFiles(files []string) (string, error) {
 		return "", fmt.Errorf("torrent client not initialized")
 	}
 
-	log.Printf("✓ Client exists, continuing...")
-
 	if len(files) == 0 {
 		return "", fmt.Errorf("no files provided")
 	}
 
 	log.Printf("Creating torrent from %d file(s)...", len(files))
 
+	// Determine the root path for building torrent
 	var rootPath string
 	var isSingleFile bool
 
-	log.Printf("🔍 Checking file count...")
 	if len(files) == 1 {
-		isSingleFile = true
+		// Single file
 		rootPath = files[0]
+		isSingleFile = true
 		log.Printf("✓ Single file mode: %s", rootPath)
 	} else {
-		log.Printf("✓ Multiple files mode")
+		// Multiple files - must be in same directory
 		parentDir := filepath.Dir(files[0])
 		for _, f := range files[1:] {
 			if filepath.Dir(f) != parentDir {
@@ -418,63 +429,11 @@ func (a *App) CreateTorrentFromFiles(files []string) (string, error) {
 			}
 		}
 		rootPath = parentDir
+		isSingleFile = false
+		log.Printf("✓ Multiple files mode: %s", parentDir)
 	}
 
 	log.Printf("🔍 Root path: %s", rootPath)
-	log.Printf("🔍 Is single file: %v", isSingleFile)
-
-	// For single files, we need to create a directory structure
-	var torrentRootPath string
-	if isSingleFile {
-		log.Printf("🔍 Processing single file...")
-
-		// Create a directory with the file's name (without extension)
-		fileName := filepath.Base(rootPath)
-		log.Printf("🔍 File name: %s", fileName)
-
-		dirName := fileName
-		log.Printf("🔍 Dir name: %s", dirName)
-
-		torrentDir := filepath.Join(a.downloadDir, dirName)
-		log.Printf("🔍 Torrent dir: %s", torrentDir)
-
-		// Create directory if it doesn't exist
-		log.Printf("🔍 Creating directory...")
-		if err := os.MkdirAll(torrentDir, 0755); err != nil {
-			log.Printf("❌ Failed to create directory: %v", err)
-			return "", fmt.Errorf("failed to create torrent directory: %w", err)
-		}
-		log.Printf("✓ Directory created")
-
-		destPath := filepath.Join(torrentDir, fileName)
-		log.Printf("🔍 Dest path: %s", destPath)
-
-		// Check if we need to copy the file
-		if rootPath != destPath {
-			log.Printf("🔍 Need to copy file from %s to %s", rootPath, destPath)
-			log.Printf("Copying file to torrent structure: %s", destPath)
-
-			// Remove existing file if present
-			log.Printf("🔍 Removing existing file if present...")
-			os.Remove(destPath)
-
-			log.Printf("🔍 Starting file copy...")
-			if err := copyFile(rootPath, destPath); err != nil {
-				log.Printf("❌ Failed to copy file: %v", err)
-				return "", fmt.Errorf("failed to copy file: %w", err)
-			}
-
-			log.Printf("✓ File prepared at: %s", destPath)
-		}
-
-		torrentRootPath = torrentDir
-		log.Printf("🔍 Torrent root path set to: %s", torrentRootPath)
-	} else {
-		// For multiple files, just use the directory
-		torrentRootPath = rootPath
-	}
-
-	log.Printf("Building torrent from path: %s", torrentRootPath)
 
 	// Build metainfo
 	log.Printf("🔍 Creating metainfo...")
@@ -484,20 +443,35 @@ func (a *App) CreateTorrentFromFiles(files []string) (string, error) {
 
 	// Build from file path
 	log.Printf("🔍 Building from file path...")
-	if err := info.BuildFromFilePath(torrentRootPath); err != nil {
+	if err := info.BuildFromFilePath(rootPath); err != nil {
 		log.Printf("❌ Failed to build from file path: %v", err)
 		return "", fmt.Errorf("failed to build torrent info: %w", err)
 	}
 	log.Printf("✓ Built from file path")
 
+	// For single file, ensure the path is set correctly
+	if isSingleFile {
+		info.Files = []metainfo.FileInfo{{
+			Path:   []string{},
+			Length: info.TotalLength(),
+		}}
+	}
+
 	log.Printf("Generating pieces for torrent...")
 
 	// Generate pieces (hash the data)
 	err := info.GeneratePieces(func(fi metainfo.FileInfo) (io.ReadCloser, error) {
-		fullPath := filepath.Join(torrentRootPath, filepath.Join(fi.Path...))
+		var fullPath string
+		if isSingleFile {
+			fullPath = rootPath
+		} else {
+			fullPath = filepath.Join(rootPath, filepath.Join(fi.Path...))
+		}
+		log.Printf("🔍 Reading file for hashing: %s", fullPath)
 		return os.Open(fullPath)
 	})
 	if err != nil {
+		log.Printf("❌ Failed to generate pieces: %v", err)
 		return "", fmt.Errorf("failed to generate pieces: %w", err)
 	}
 
@@ -523,13 +497,55 @@ func (a *App) CreateTorrentFromFiles(files []string) (string, error) {
 	}
 	magnetStr := magnet.String()
 
-	// Add torrent to client
-	t, err := a.client.AddTorrent(&mi)
+	hash := mi.HashInfoBytes().String()
+	log.Printf("✓ Generated torrent with hash: %s", hash)
+
+	// Determine storage base directory
+	storageBaseDir := rootPath
+
+	log.Printf("🔍 Storage base directory: %s", storageBaseDir)
+
+	// Create piece completion in the appropriate directory
+	var pcDir string
+	if isSingleFile {
+		pcDir = filepath.Dir(rootPath)
+	} else {
+		pcDir = rootPath
+	}
+	pc, err := storage.NewDefaultPieceCompletionForDir(pcDir)
 	if err != nil {
-		return "", fmt.Errorf("failed to add torrent for seeding: %w", err)
+		log.Printf("❌ Failed to create piece completion: %v", err)
+		return "", fmt.Errorf("failed to create piece completion: %w", err)
 	}
 
-	hash := t.InfoHash().String()
+	// Add torrent with custom storage
+	t, isNew := a.client.AddTorrentOpt(torrent.AddTorrentOpts{
+		InfoHash: mi.HashInfoBytes(),
+		Storage: storage.NewFileOpts(storage.NewFileClientOpts{
+			ClientBaseDir: storageBaseDir,
+			FilePathMaker: func(opts storage.FilePathMakerOpts) string {
+				// Return the path structure as-is from the metainfo
+				return filepath.Join(opts.File.Path...)
+			},
+			TorrentDirMaker: nil,
+			PieceCompletion: pc,
+		}),
+	})
+
+	if !isNew {
+		log.Printf("⚠ Torrent already exists, using existing instance")
+	}
+
+	// Merge the metadata
+	err = t.MergeSpec(&torrent.TorrentSpec{
+		InfoBytes: mi.InfoBytes,
+		Trackers:  mi.AnnounceList,
+	})
+	if err != nil {
+		log.Printf("❌ Failed to merge spec: %v", err)
+		return "", fmt.Errorf("failed to merge torrent spec: %w", err)
+	}
+
 	log.Printf("✓ Added torrent with hash: %s", hash)
 
 	// Wait for info
@@ -538,23 +554,20 @@ func (a *App) CreateTorrentFromFiles(files []string) (string, error) {
 
 	// DEBUG: Log expected file paths
 	for _, file := range t.Files() {
-		expectedPath := filepath.Join(a.downloadDir, file.Path())
+		var expectedPath string
+		if isSingleFile {
+			expectedPath = storageBaseDir
+		} else {
+			expectedPath = filepath.Join(storageBaseDir, file.Path())
+		}
 		log.Printf("🔍 Torrent expects file at: %s", expectedPath)
 
-		if _, err := os.Stat(expectedPath); err != nil {
+		if stat, err := os.Stat(expectedPath); err != nil {
 			log.Printf("❌ File NOT found: %s", err)
 		} else {
-			log.Printf("✓ File exists at expected location")
+			log.Printf("✓ File exists: size=%d", stat.Size())
 		}
 	}
-
-	// Tell the torrent to download all pieces
-	t.Seeding()
-	t.AllowDataUpload()
-	t.AllowDataDownload()
-	t.VerifyData()
-
-	log.Printf("Started verification of existing files")
 
 	// Initialize speed trackers
 	a.speedsMutex.Lock()
@@ -567,9 +580,17 @@ func (a *App) CreateTorrentFromFiles(files []string) (string, error) {
 	a.torrents[hash] = t
 	a.torrentsMutex.Unlock()
 
+	// Start seeding process
+	t.AllowDataUpload()
+	t.AllowDataDownload()
+
+	// Verify the data is there
+	log.Printf("Starting data verification...")
+	t.VerifyData()
+
 	// Wait for verification in background
 	go func() {
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
@@ -592,6 +613,7 @@ func (a *App) CreateTorrentFromFiles(files []string) (string, error) {
 				if completed >= total {
 					log.Printf("✓ File verification complete: 100%%")
 					log.Printf("✓ Now seeding torrent: %s", t.Name())
+
 					wailsruntime.EventsEmit(a.ctx, "torrent-added", hash)
 					a.saveTorrentStates()
 					return
@@ -604,6 +626,7 @@ func (a *App) CreateTorrentFromFiles(files []string) (string, error) {
 
 				if completed == 0 {
 					log.Printf("❌ Verification failed: 0%% complete")
+					log.Printf("❌ Files may not be at expected location")
 				} else if completed < total {
 					log.Printf("⚠ Verification incomplete: %.1f%% (%d/%d bytes)", percentage, completed, total)
 				} else {
@@ -621,28 +644,6 @@ func (a *App) CreateTorrentFromFiles(files []string) (string, error) {
 	log.Printf("✓ Magnet link: %s", magnetStr)
 
 	return magnetStr, nil
-}
-
-// Helper function to copy file
-func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer sourceFile.Close()
-
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
-
-	_, err = io.Copy(destFile, sourceFile)
-	if err != nil {
-		return err
-	}
-
-	return destFile.Sync()
 }
 
 // GetTorrents returns all torrents
@@ -684,26 +685,6 @@ func (a *App) PauseTorrent(infoHash string) error {
 
 	// Cancel all pieces to stop downloading
 	t.CancelPieces(0, t.NumPieces())
-
-	// Optionally drop connections
-	t.Drop()
-
-	// Re-add immediately but don't start download
-	if t.Info() != nil {
-		mi := metainfo.MetaInfo{
-			InfoBytes: bencode.MustMarshal(*t.Info()),
-		}
-
-		newT, err := a.client.AddTorrent(&mi)
-		if err != nil {
-			return fmt.Errorf("failed to re-add torrent: %w", err)
-		}
-
-		// Update reference
-		a.torrentsMutex.Lock()
-		a.torrents[infoHash] = newT
-		a.torrentsMutex.Unlock()
-	}
 
 	// Mark as paused
 	a.pausedMutex.Lock()
@@ -811,7 +792,7 @@ func (a *App) RemoveTorrent(infoHash string, deleteFiles bool) error {
 		log.Printf("🗑 Removed torrent: %s", torrentName)
 	}
 
-	a.saveTorrentStates() // Save state after removal
+	a.saveTorrentStates()
 	log.Printf("✓ Torrent states saved")
 
 	return nil
