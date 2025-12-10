@@ -430,7 +430,7 @@ func (a *App) CreateTorrentFromFiles(files []string) (string, error) {
 	log.Printf("Got torrent info: %s", t.Name())
 
 	// Download all pieces (this verifies existing data)
-	t.DownloadAll()
+	t.Seeding()
 	log.Printf("Started verification of existing files...")
 
 	// Wait for verification to complete
