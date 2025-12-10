@@ -269,7 +269,6 @@ func (a *App) loadSavedTorrents() {
 	}
 }
 
-// AddMagnet adds a torrent from a magnet link
 func (a *App) AddMagnet(magnetURI string) error {
 	if a.client == nil {
 		return fmt.Errorf("torrent client not initialized")
@@ -285,54 +284,61 @@ func (a *App) AddMagnet(magnetURI string) error {
 	hash := t.InfoHash().String()
 	log.Printf("✓ Magnet added with hash: %s", hash)
 
-	// Initialize speed trackers
+	// Initialize trackers
 	a.speedsMutex.Lock()
 	a.downloadSpeeds[hash] = &speedTracker{lastTime: time.Now()}
 	a.uploadSpeeds[hash] = &speedTracker{lastTime: time.Now()}
 	a.speedsMutex.Unlock()
 
-	// Add to torrents map
 	a.torrentsMutex.Lock()
 	a.torrents[hash] = t
 	a.torrentsMutex.Unlock()
 
 	log.Printf("Waiting for metadata...")
 
-	// Emit immediately so UI shows "loading metadata" state
+	// Emit immediately so UI shows the torrent in "loading" state
 	wailsruntime.EventsEmit(a.ctx, "torrent-added", hash)
 
-	// Wait for info and start download
+	// Wait for metadata
 	go func() {
 		select {
 		case <-t.GotInfo():
-			log.Printf("✓ Got metadata for torrent: %s", t.Name())
+			log.Printf("✓ Got metadata: %s", t.Name())
 			log.Printf("   Size: %s", formatBytes(t.Length()))
 			log.Printf("   Files: %d", len(t.Files()))
 
-			// Start downloading all pieces
+			// Start downloading
 			t.DownloadAll()
-
-			// Allow data transfer
 			t.AllowDataDownload()
 			t.AllowDataUpload()
 
 			log.Printf("✓ Started downloading: %s", t.Name())
 
-			// Save state and notify UI
+			// Save and notify UI
 			a.saveTorrentStates()
 			wailsruntime.EventsEmit(a.ctx, "torrent-updated", hash)
 
-		case <-time.After(120 * time.Second): // Increased timeout to 120s
+		case <-time.After(120 * time.Second):
 			log.Printf("⚠ Timeout waiting for metadata for hash: %s", hash)
-			log.Printf("   This could mean: no peers available, or DHT/tracker issues")
+			log.Printf("   Torrent may have no peers or slow DHT")
 
-			// Still try to download in case peers appear later
-			t.DownloadAll()
+			// Still allow connections
 			t.AllowDataDownload()
 			t.AllowDataUpload()
 
+			// Continue waiting in background
+			go func() {
+				log.Printf("🔄 Continuing to wait for metadata...")
+				<-t.GotInfo()
+				log.Printf("✓ Finally got metadata: %s", t.Name())
+				t.DownloadAll()
+				a.saveTorrentStates()
+				wailsruntime.EventsEmit(a.ctx, "torrent-updated", hash)
+			}()
+
+			// Notify UI of timeout
 			wailsruntime.EventsEmit(a.ctx, "torrent-updated", hash)
-			wailsruntime.LogWarning(a.ctx, "Metadata fetch slow - torrent may be rare or have no peers")
+			wailsruntime.LogWarning(a.ctx, "Metadata fetch is taking longer than expected")
 		}
 	}()
 
@@ -543,7 +549,7 @@ func (a *App) CreateTorrentFromFiles(files []string) (string, error) {
 	}
 
 	// Tell the torrent to download all pieces
-	t.DownloadAll()
+	t.Seeding()
 	t.AllowDataUpload()
 	t.AllowDataDownload()
 	t.VerifyData()
